@@ -497,12 +497,13 @@ function resolveVsCodeSettingsFiles(insiders: boolean): string[] {
 /** The client files this run is about to configure, or null when no Claude target is selected. */
 async function claudeConnectTargets(
   targets: ConnectTargets,
-  insiders: boolean
+  insiders: boolean,
+  desktopConfigFile: string | undefined
 ): Promise<ProviderSettingsConnectTargets | null> {
   if (!targets.claudeDesktop && !targets.vscodeClaudeCode && !targets.claudeCodeOtlp) return null;
   return {
-    ...(targets.claudeDesktop
-      ? { desktop: { configFile: await getCodeMieDesktopConfigPath(), managedFile: getClaudeDesktopManagedSettingsPath() } }
+    ...(targets.claudeDesktop && desktopConfigFile !== undefined
+      ? { desktop: { configFile: desktopConfigFile, managedFile: getClaudeDesktopManagedSettingsPath() } }
       : {}),
     ...(targets.vscodeClaudeCode ? { vscodeSettingsFiles: resolveVsCodeSettingsFiles(insiders) } : {}),
     claudeCodeOtlp: targets.claudeCodeOtlp,
@@ -517,10 +518,10 @@ async function claudeConnectTargets(
 async function checkClaudeProviderSettings(
   targets: ConnectTargets,
   profile: ProviderSettingsProfile,
-  options: { silent: boolean; insiders: boolean }
+  options: { silent: boolean; insiders: boolean; desktopConfigFile: string | undefined }
 ): Promise<ProviderSettingsSwitch | null> {
-  const { silent, insiders } = options;
-  const connect = await claudeConnectTargets(targets, insiders);
+  const { silent, insiders, desktopConfigFile } = options;
+  const connect = await claudeConnectTargets(targets, insiders, desktopConfigFile);
   if (!connect) return null;
   const { AgentRegistry } = await import('@/agents/registry.js');
   const claude = AgentRegistry.getAgent(CLAUDE_AGENT);
@@ -767,7 +768,12 @@ function printFailures(results: TargetResult[]): void {
   }
 }
 
-async function runClaudeDesktop(state: DaemonState, verbose: boolean): Promise<TargetResult> {
+/** `desktopConfigFile` is the CodeMie entry the provider-settings gate inspected; the write targets the same file. */
+async function runClaudeDesktop(
+  state: DaemonState,
+  verbose: boolean,
+  desktopConfigFile: string | undefined
+): Promise<TargetResult> {
   try {
     const canonical = state.syncCodeMieUrl
       ? await fetchManagedMcpServers('claude-desktop', state.syncCodeMieUrl)
@@ -793,7 +799,8 @@ async function runClaudeDesktop(state: DaemonState, verbose: boolean): Promise<T
       getDesktopBaseDir(),
       orgMcpServers,
       undefined, // default managed-MCP state path
-      state.project
+      state.project,
+      desktopConfigFile
     );
     logger.info(
       '[proxy] Claude Desktop proxy configuration written',
@@ -1193,6 +1200,8 @@ export async function connectTargets(opts: ConnectOptions): Promise<void> {
   let agreement: ClaudeCodeOtlpAgreement | undefined;
   let projectBinding: ProjectBindingState | undefined;
   let settingsSwitch: ProviderSettingsSwitch | null = null;
+  /** The CodeMie Claude Desktop entry this run inspects and writes; resolved once, before the provider-settings gate. */
+  let desktopConfigFile: string | undefined;
   let scopeBaselines: ScopeBaselines;
   try {
     // Pre-lock phase: the scope confirmation runs before SSO, the daemon or any config is touched,
@@ -1256,7 +1265,13 @@ export async function connectTargets(opts: ConnectOptions): Promise<void> {
     // Before anything is started or written: Bedrock settings in Claude's own configuration would send
     // Claude traffic around the gateway this command is about to connect. Only the clients that will be
     // configured (an aggregate flag leaves out the ones not found on this machine) are checked.
-    settingsSwitch = await checkClaudeProviderSettings(activeTargets, config, { silent: Boolean(opts.yes), insiders });
+    // Resolved once: the gate inspects this Desktop entry and the write below targets it, whichever key each would read.
+    desktopConfigFile = activeTargets.claudeDesktop ? await getCodeMieDesktopConfigPath() : undefined;
+    settingsSwitch = await checkClaudeProviderSettings(
+      activeTargets,
+      config,
+      { silent: Boolean(opts.yes), insiders, desktopConfigFile }
+    );
 
     if (activeTargets.claudeCodeOtlp && otlpDisplay) {
       const confirmed = await confirmClaudeCodeOtlp(
@@ -1333,7 +1348,7 @@ export async function connectTargets(opts: ConnectOptions): Promise<void> {
   };
   const editionFlag = (flag: string): string => (insiders ? `${flag} --insiders` : flag);
   if (activeTargets.claudeDesktop) {
-    await runClient('--claude-desktop', runClaudeDesktop(state, verbose), 'claudeDesktop');
+    await runClient('--claude-desktop', runClaudeDesktop(state, verbose, desktopConfigFile), 'claudeDesktop');
   }
   if (activeTargets.vscode) {
     await runClient(editionFlag('--vscode'), runVscodeByok(state, insiders, config, verbose, projectBinding));
