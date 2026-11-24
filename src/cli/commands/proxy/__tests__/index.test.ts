@@ -498,7 +498,7 @@ describe('proxy connect --claude-desktop', () => {
       startedAt: new Date().toISOString(),
       telemetryMode: 'claude-desktop',
     } as Awaited<ReturnType<typeof spawnDaemon>>);
-    vi.mocked(writeDesktopConfig).mockResolvedValue('/path/to/config');
+    vi.mocked(writeDesktopConfig).mockResolvedValue({ configPath: '/path/to/config', activated: false });
 
     const command = createProxyCommand();
     await command.parseAsync(['connect', '--claude-desktop', '--profile', 'test-profile'], { from: 'user' });
@@ -537,7 +537,7 @@ describe('proxy connect --claude-desktop', () => {
       startedAt: new Date().toISOString(),
       telemetryMode: 'claude-desktop',
     } as Awaited<ReturnType<typeof spawnDaemon>>);
-    vi.mocked(writeDesktopConfig).mockResolvedValue('/path/to/config');
+    vi.mocked(writeDesktopConfig).mockResolvedValue({ configPath: '/path/to/config', activated: false });
     vi.mocked(describeManagedSettingsOverride).mockReturnValue(
       '/etc/claude-desktop/managed-settings.json exists. Claude Desktop applies managed settings instead of local configuration, so this write may have no effect.'
     );
@@ -581,7 +581,7 @@ describe('proxy connect --claude-desktop', () => {
       startedAt: new Date().toISOString(),
       telemetryMode: 'claude-desktop',
     } as Awaited<ReturnType<typeof spawnDaemon>>);
-    vi.mocked(writeDesktopConfig).mockResolvedValue('/path/to/config');
+    vi.mocked(writeDesktopConfig).mockResolvedValue({ configPath: '/path/to/config', activated: false });
     vi.mocked(describeManagedSettingsOverride).mockReturnValue(null);
 
     await createProxyCommand().parseAsync(['connect', '--claude-desktop', '--profile', 'test-profile'], {
@@ -622,7 +622,7 @@ describe('proxy connect --claude-desktop', () => {
       startedAt: new Date().toISOString(),
       telemetryMode: 'claude-desktop',
     } as Awaited<ReturnType<typeof spawnDaemon>>);
-    vi.mocked(writeDesktopConfig).mockResolvedValue('/path/to/config');
+    vi.mocked(writeDesktopConfig).mockResolvedValue({ configPath: '/path/to/config', activated: false });
 
     await createProxyCommand().parseAsync(['connect', '--claude-desktop'], { from: 'user' });
 
