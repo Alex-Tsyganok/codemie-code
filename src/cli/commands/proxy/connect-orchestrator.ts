@@ -38,7 +38,8 @@ import { describeProjectBinding, sanitizeDisplayText, type ProjectBindingState }
 import {
   writeDesktopConfig,
   getDesktopBaseDir,
-  getDesktopConfigPath,
+  getCodeMieDesktopConfigPath,
+  CODEMIE_DESKTOP_CONFIG_NAME,
   readDesktopGateway,
   mapCanonicalToDesktop,
   describeManagedSettingsOverride,
@@ -501,7 +502,7 @@ async function claudeConnectTargets(
   if (!targets.claudeDesktop && !targets.vscodeClaudeCode && !targets.claudeCodeOtlp) return null;
   return {
     ...(targets.claudeDesktop
-      ? { desktop: { configFile: await getDesktopConfigPath(), managedFile: getClaudeDesktopManagedSettingsPath() } }
+      ? { desktop: { configFile: await getCodeMieDesktopConfigPath(), managedFile: getClaudeDesktopManagedSettingsPath() } }
       : {}),
     ...(targets.vscodeClaudeCode ? { vscodeSettingsFiles: resolveVsCodeSettingsFiles(insiders) } : {}),
     claudeCodeOtlp: targets.claudeCodeOtlp,
@@ -786,7 +787,7 @@ async function runClaudeDesktop(state: DaemonState, verbose: boolean): Promise<T
         noAuthCount: oauthShapes.noAuth,
       })
     );
-    const { configPath } = await writeDesktopConfig(
+    const { configPath, switchedFrom } = await writeDesktopConfig(
       state.url,
       state.gatewayKey,
       getDesktopBaseDir(),
@@ -817,6 +818,12 @@ async function runClaudeDesktop(state: DaemonState, verbose: boolean): Promise<T
       console.log(`  Config:  ${configPath}`);
       console.log(`  Gateway: ${state.url}`);
       console.log(chalk.dim('  Telemetry: metrics and conversations will sync as claude-desktop.'));
+    }
+    if (switchedFrom !== undefined) {
+      console.log(chalk.yellow(
+        `  Switched Claude Desktop's active configuration from "${sanitizeDisplayText(switchedFrom)}" ` +
+        `to "${CODEMIE_DESKTOP_CONFIG_NAME}".`
+      ));
     }
     console.log(chalk.yellow('  Restart Claude Desktop to apply changes.'));
     return { label: 'Claude Desktop', ok: true };
