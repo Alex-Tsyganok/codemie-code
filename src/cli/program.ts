@@ -37,6 +37,7 @@ import { createCodebaseCommand } from './commands/codebase/index.js';
 import { createDocsCommand } from './commands/docs.js';
 import { createTipsCommand } from './commands/tips.js';
 import { createWhatsnewCommand } from './commands/whatsnew.js';
+import { createCompletionCommand } from './commands/completion.js';
 import { applyRelatedHelp } from './related-commands.js';
 import { getDirname } from '../utils/paths.js';
 
@@ -45,7 +46,11 @@ import { getDirname } from '../utils/paths.js';
  * reading package.json, so it can be loaded from tests.
  */
 export function createProgram(): Command {
-  const program = new Command();
+  // Positional options on the root: a nested command's own option (e.g.
+  // `analytics sync install --include-external <policy>`) must not be consumed by an
+  // identically-named option on an ancestor. Root options (`--task`, `--version`) are only
+  // recognised before the subcommand name.
+  const program = new Command().enablePositionalOptions();
 
   // Read version from package.json
   let version = '1.0.0';
@@ -114,6 +119,7 @@ Profile selection:
   program.addCommand(createDocsCommand());
   program.addCommand(createTipsCommand());
   program.addCommand(createWhatsnewCommand());
+  program.addCommand(createCompletionCommand());
 
   applyRelatedHelp(program);
 

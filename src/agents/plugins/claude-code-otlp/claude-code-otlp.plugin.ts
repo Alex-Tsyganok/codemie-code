@@ -38,7 +38,7 @@ import { CLAUDE_CODE_OTLP_AGENT_NAME } from './claude-code-otlp.constants.js';
 import { type ClaudeForwardDecision, isClaudeCodeHookInput } from './claude-code-otlp.types.js';
 import { buildClaudeEventId } from './claude-code-otlp.event-id.js';
 import { readPromptHookTimeoutSeconds } from './claude-code-otlp.allowlist.js';
-import { evaluateClaudeAnalyticsGate } from './claude-code-otlp.gate.js';
+import { evaluateClaudeAnalyticsGate, type ClaudeAnalyticsGateReason } from './claude-code-otlp.gate.js';
 import { readClaudeAnalyticsPreferences } from './claude-code-otlp.preferences.js';
 import { stopNoticeText } from './claude-code-otlp.notice.js';
 import { currentEvidenceIdentity } from '@/agents/core/evidence/hook-identity.js';
@@ -46,6 +46,7 @@ import { hasRecordForSession, readRecord, recordKey, type EvidenceRecord } from 
 import { isStopped, takeNotice, writeStop, type StopReason } from '@/agents/core/evidence/stop-marker.js';
 import { scopeViolation } from '@/agents/core/evidence/session-scope.js';
 import { hasPendingOwnerSession } from '@/agents/core/evidence/owner-pending.js';
+import { clearOwnerlessSessionStart, hasOwnerlessSessionStart, markOwnerlessSessionStart } from '@/agents/core/evidence/ownerless-session.js';
 import type { OtlpAdapterDeps } from '@/agents/core/types.js';
 import {
   buildSessionEnvEvent,
@@ -112,49 +113,53 @@ const ALWAYS_DROPPED_FIELDS: readonly string[] = [
 
 /** Timeout the connector wrote for every hook before UserPromptSubmit got its own. */
 const LEGACY_HOOK_TIMEOUT_SECONDS = 30;
+/** Gate reasons that are the developer's own filters: analytics off, the project excluded or outside the tracked list. */
+const FILTER_REASONS: ReadonlySet<ClaudeAnalyticsGateReason> = new Set<ClaudeAnalyticsGateReason>(['disabled', 'project-excluded', 'not-in-allowlist']);
 const HOOK_TIMEOUT_HEADROOM_MS = 15_000;
 
 export class ClaudeCodeOtlpPlugin extends OtlpAgentAdapter<HookInput, UserPromptSubmitHookSpecificOutput> {
   public readonly name = CLAUDE_CODE_OTLP_AGENT_NAME;
   protected override readonly configuredProjectWins = true;
   protected async extractHookContext(hookInput: HookInput): Promise<OtlpHookContext> {
-    const [settings, hookConfig] = await Promise.all([
-      readClaudeSettingsEnv(hookInput.cwd),
-      loadHookConfig(hookInput.cwd),
-    ]);
-    const config = hookConfig?.config;
-    const authType = config?.provider ? ProviderRegistry.getProvider(config.provider)?.authType : undefined;
-    const codemieProvider = authType !== 'none' && (authType === 'sso' || config?.authMethod === 'jwt');
-    const routingInput: RoutingInput = {
-      env: process.env,
-      settingsEnv: settings.env,
-      settingsUnknown: !settings.complete,
-      codemieProvider,
-      profileBaseUrl: config?.baseUrl,
-      profileName: config?.name,
-    };
-    // Native launch on a loopback endpoint: the live proxy daemon is the only thing that can prove it routed.
-    if (localProxyCandidate(routingInput)) {
-      routingInput.localProxy = await resolveLocalProxy();
-      const daemonProfile = routingInput.localProxy?.profile;
-      if (routingInput.localProxy && daemonProfile !== routingInput.profileName) {
-        logger.debug(`[${this.name}] local proxy daemon serves another profile; routing stays unproven`);
+    const evidenceInputs = await this.policy.evidenceInputs(async (): Promise<EvidenceInputs> => {
+      const [settings, hookConfig] = await Promise.all([
+        readClaudeSettingsEnv(hookInput.cwd),
+        loadHookConfig(hookInput.cwd),
+      ]);
+      const config = hookConfig?.config;
+      const authType = config?.provider ? ProviderRegistry.getProvider(config.provider)?.authType : undefined;
+      const codemieProvider = authType !== 'none' && (authType === 'sso' || config?.authMethod === 'jwt');
+      const routingInput: RoutingInput = {
+        env: process.env,
+        settingsEnv: settings.env,
+        settingsUnknown: !settings.complete,
+        codemieProvider,
+        profileBaseUrl: config?.baseUrl,
+        profileName: config?.name,
+      };
+      // Native launch on a loopback endpoint: the live proxy daemon is the only thing that can prove it routed.
+      if (localProxyCandidate(routingInput)) {
+        routingInput.localProxy = await resolveLocalProxy();
+        const daemonProfile = routingInput.localProxy?.profile;
+        if (routingInput.localProxy && daemonProfile !== routingInput.profileName) {
+          logger.debug(`[${this.name}] local proxy daemon serves another profile; routing stays unproven`);
+        }
       }
-    }
-    const routing = routedViaCodemie(routingInput);
-    const prefs = await readClaudeAnalyticsPreferences();
-    const evidenceInputs: EvidenceInputs = {
-      // The saved OAuth login names the payer only when the session really authenticates with it.
-      organization: oauthAccountPays({ ...routingInput, apiKeyHelper: settings.apiKeyHelper }) ? await readClaudeOrganization() : undefined,
-      routing,
-      funding_route: fundingRoute({ ...routingInput, apiKeyHelper: settings.apiKeyHelper }, routing),
-      collection_generation: prefs.kind === 'ok' ? prefs.value.collectionGeneration : 0,
-    };
+      const routing = routedViaCodemie(routingInput);
+      const prefs = await readClaudeAnalyticsPreferences();
+      return {
+        // The saved OAuth login names the payer only when the session really authenticates with it.
+        organization: oauthAccountPays({ ...routingInput, apiKeyHelper: settings.apiKeyHelper }) ? await readClaudeOrganization() : undefined,
+        routing,
+        funding_route: fundingRoute({ ...routingInput, apiKeyHelper: settings.apiKeyHelper }, routing),
+        collection_generation: prefs.kind === 'ok' ? prefs.value.collectionGeneration : 0,
+      };
+    });
     return {
       cwd: hookInput.cwd,
       prompt: hookInput.hook_event_name === 'UserPromptSubmit' ? hookInput.prompt : undefined,
       sessionId: hookInput.session_id,
-      evidenceInputs,
+      ...(evidenceInputs && { evidenceInputs }),
     };
   }
 
@@ -166,16 +171,31 @@ export class ClaudeCodeOtlpPlugin extends OtlpAgentAdapter<HookInput, UserPrompt
   protected async isTracked(hookInput: HookInput): Promise<boolean> {
     const decision = await evaluateClaudeAnalyticsGate(hookInput.cwd);
     logger.debug(`[${this.name}] analytics gate decision`, ...sanitizeLogArgs({ reason: decision.reason }));
+    this.gateReason = decision.reason;
     return decision.tracked;
+  }
+
+  /** The reason of the last `isTracked` decision. */
+  private gateReason?: ClaudeAnalyticsGateReason;
+
+  protected override async untrackedByFilter(): Promise<boolean> {
+    return this.gateReason !== undefined && FILTER_REASONS.has(this.gateReason);
+  }
+
+  protected override sessionIdOf(hookInput: HookInput): string | undefined {
+    return hookInput.session_id;
   }
 
   /** The one-shot user notice of this hook, printed once at the end (or merged into a block answer). */
   private pendingNotice?: string;
+  private promptAuthResult?: AuthGateResult;
 
   public override async processOtlpEvent(rawHookInput: string, deps: OtlpAdapterDeps): Promise<void> {
+    this.promptAuthResult = undefined;
     try {
       await super.processOtlpEvent(rawHookInput, deps);
     } finally {
+      this.promptAuthResult = undefined;
       // The hook always returns normally; the notice is a systemMessage (user-visible, not model context).
       if (this.pendingNotice) {
         console.log(JSON.stringify({ systemMessage: this.pendingNotice }));
@@ -216,15 +236,32 @@ export class ClaudeCodeOtlpPlugin extends OtlpAgentAdapter<HookInput, UserPrompt
    */
   protected override async transitionGate(hookInput: HookInput): Promise<'continue' | 'stop'> {
     try {
-      const id = await currentEvidenceIdentity();
+      let id = await currentEvidenceIdentity();
       const sessionId = hookInput.session_id;
       if (!id) {
-        // No owner to key a record by. Only a fresh session, one already held for its owner, or one with a record may go on
-        // (held for replay, which re-checks it); an unknown mid-session scope never gets a record made from an outage.
+        // A prompt checks auth before the ownerless transition, so a signed-out prompt never reaches the model.
+        // Whether the session may then continue is decided by what the session is (see below), not by how the owner
+        // was learned: a resumed or forked session with no record stays stopped even after sign-in.
         this.identityUnverifiedAtGate = true;
-        const source = readOptionalString(hookInput, 'source');
-        const fresh = hookInput.hook_event_name === 'SessionStart' && (source === 'startup' || source === 'clear');
-        return fresh || (await hasPendingOwnerSession(sessionId)) || (await hasRecordForSession(sessionId)) ? 'continue' : 'stop';
+        if (hookInput.hook_event_name === 'UserPromptSubmit') {
+          this.promptAuthResult = await this.ensureProxyAuth();
+          if (!this.promptAuthResult.ok) {
+            const decision = this.promptAuthBlock(this.promptAuthResult);
+            logger.error(`[${this.name}] Blocking prompt: ${decision.reason}`);
+            this.emitBlock(decision);
+            return 'stop';
+          }
+          id = await currentEvidenceIdentity();
+        }
+        if (!id) {
+          const source = readOptionalString(hookInput, 'source');
+          const fresh = hookInput.hook_event_name === 'SessionStart' && (source === 'startup' || source === 'clear');
+          // Only a new session may later establish its first record; remember that this one began without an owner.
+          if (fresh) await markOwnerlessSessionStart(sessionId);
+          return fresh || (await hasPendingOwnerSession(sessionId)) || (await hasOwnerlessSessionStart(sessionId)) || (await hasRecordForSession(sessionId))
+            ? 'continue'
+            : 'stop';
+        }
       }
       const key = recordKey(id.api_identity, id.owner_hash, sessionId);
       if (await isStopped(key)) {
@@ -238,7 +275,8 @@ export class ClaudeCodeOtlpPlugin extends OtlpAgentAdapter<HookInput, UserPrompt
       if (!found) {
         const source = readOptionalString(hookInput, 'source');
         const freshSession = hookInput.hook_event_name === 'SessionStart' && (source === 'startup' || source === 'clear');
-        if (freshSession || (await hasPendingOwnerSession(sessionId))) return 'continue';
+        // A session that began without an owner (signed out at startup) establishes its first record once the owner is known.
+        if (freshSession || (await hasPendingOwnerSession(sessionId)) || (await hasOwnerlessSessionStart(sessionId))) return 'continue';
         return this.stopSession(key, 'resume_unknown', sessionId);
       }
       const record = found.record;
@@ -269,6 +307,8 @@ export class ClaudeCodeOtlpPlugin extends OtlpAgentAdapter<HookInput, UserPrompt
    * may then name an existing session. Re-run the same checks against that record before anything is spooled.
    */
   protected override async recordGate(context: OtlpHookContext, record: EvidenceRecord): Promise<'continue' | 'stop'> {
+    // The session has its record: an ownerless-start marker has done its one job and must not admit another record.
+    await clearOwnerlessSessionStart(record.session_id);
     if (!this.identityUnverifiedAtGate) return 'continue';
     try {
       const key = recordKey(record.api_identity, record.owner_hash, record.session_id);
@@ -297,7 +337,7 @@ export class ClaudeCodeOtlpPlugin extends OtlpAgentAdapter<HookInput, UserPrompt
   protected override async onUntrackedHook(hookInput: HookInput): Promise<void> {
     try {
       const decision = await evaluateClaudeAnalyticsGate(hookInput.cwd);
-      if (decision.reason !== 'project-excluded' && decision.reason !== 'not-in-allowlist') return;
+      if (decision.reason !== 'project-excluded' && decision.reason !== 'not-in-allowlist' && decision.reason !== 'allowlist-unresolved') return;
       const id = await currentEvidenceIdentity();
       if (!id) return;
       const key = recordKey(id.api_identity, id.owner_hash, hookInput.session_id);
@@ -700,7 +740,9 @@ export class ClaudeCodeOtlpPlugin extends OtlpAgentAdapter<HookInput, UserPrompt
   }
 
   private async onUserPromptSubmit(hookInput: UserPromptSubmitHookInput): Promise<ClaudeForwardDecision> {
-    const authResult = await this.ensureProxyAuth();
+    const authResult = this.promptAuthResult
+      ?? (await this.policy.authorize<AuthGateResult>(() => this.ensureProxyAuth(), { ok: true }));
+    this.promptAuthResult = undefined;
 
     if (authResult.ok) {
       await markReopenedActive(hookInput.session_id); // a prompt is the reopened session's own activity
@@ -724,6 +766,12 @@ export class ClaudeCodeOtlpPlugin extends OtlpAgentAdapter<HookInput, UserPrompt
       }
     }
 
+    return this.promptAuthBlock(authResult);
+  }
+
+  private promptAuthBlock(
+    authResult: Extract<AuthGateResult, { ok: false }>
+  ): Extract<ClaudeForwardDecision, { decision: 'block' }> {
     return {
       decision: 'block',
       reason: `${describeLogin(authResult.loginOutcome, { wait: authResult.waitResult })}\n(${authResult.reason})`,
@@ -731,7 +779,7 @@ export class ClaudeCodeOtlpPlugin extends OtlpAgentAdapter<HookInput, UserPrompt
         hookEventName: "UserPromptSubmit",
         suppressOriginalPrompt: true,
       }
-    }
+    };
   }
 
   // Tool events go through withoutSensitiveFileContent: a call on a credentials file would otherwise

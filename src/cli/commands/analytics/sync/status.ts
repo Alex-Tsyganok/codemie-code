@@ -28,7 +28,8 @@ import { lookbackText, webhookHost } from './format.js';
 import { readMarker } from './marker.js';
 import { errorMessage, redactSecrets } from './redact.js';
 import type { TargetId } from './run-sync.js';
-import { createRealSchedulerDeps, createScheduler } from './scheduler/index.js';
+import { createRealSchedulerDeps, createScheduler, resolveSchedulerName } from './scheduler/index.js';
+import type { JobState, Scheduler } from './scheduler/index.js';
 import { gitMarkerPath } from './targets/git-target.js';
 import type { SyncSettings } from './types.js';
 
@@ -38,13 +39,16 @@ export interface StatusDeps {
   /** Throws on an unreadable/invalid settings file; `null` means "not installed" (no
    * settings file at all). */
   loadSettings(): Promise<SyncSettings | null>;
-  query(): Promise<'enabled' | 'disabled'>;
+  /** A scheduler bound to the given OS job name (the resolved one). */
+  schedulerFor(name: string): Scheduler;
   /** The run log's full contents, or `null` when the file does not exist (or cannot be
    * read) — status never fails over a missing/unreadable log; it just reports "never". */
   readLog(): Promise<string | null>;
   readMarker(target: TargetId, now: Date): Promise<Date | null>;
   now(): Date;
   print(line: string): void;
+  /** The mode's own lines, printed after the first line of an installed status. */
+  modeLines(): string[];
 }
 
 /** One parsed outcome line from the run log. */
@@ -54,7 +58,7 @@ export interface LastRun {
 }
 
 // Matches a run-log line's `<ISO> <outcome> ...` prefix (see `run-sync.ts#formatLogLine`):
-// `ok sent <name> <bytes>` | `skip <reason>` | `fail <category> <detail>`, with an optional
+// `ok sent <name> <bytes>` | `ok sent <n> files <total bytes>` | `skip <reason>` | `fail <category> <detail>`, with an optional
 // trailing ` target=<id>` (single leading space, very end of line). Lines that don't start
 // this way (legacy collector lines, stack traces) are ignored.
 const LAST_RUN_LINE = /^(\S+) ((?:ok sent|skip|fail \w+).*)$/;
@@ -127,6 +131,11 @@ export function parseLastFailure(log: string, target: TargetId): LastRun | null 
   return last;
 }
 
+/** Whether a parsed outcome is a run that ended `ok sent` or `skip` with a warning on its line. */
+export function endedWithWarning(outcome: string): boolean {
+  return (outcome.startsWith('ok sent') || outcome.startsWith('skip')) && outcome.includes(' (warning: ');
+}
+
 /** Turn a parsed outcome (`ok sent ...` | `skip ...` | `fail <category> ...`) into the
  * human text status prints: "sent / skipped / failed", each with its detail. */
 function describeOutcome(outcome: string): string {
@@ -142,20 +151,33 @@ function describeOutcome(outcome: string): string {
   return outcome;
 }
 
-function lastRunText(lastRun: LastRun | null): string {
+/** The status line of the last run: `never`, or its time and its outcome as sent / skipped / failed with the detail. */
+export function lastRunText(lastRun: LastRun | null): string {
   return lastRun === null ? 'never' : `${lastRun.at} — ${describeOutcome(lastRun.outcome)}`;
 }
 
-/** The "Last successful send"/"Last successful push" value for `target`: the marker time,
- * `never`, or — when the marker cannot be read (EACCES, EISDIR) —
- * `unknown (<redacted reason>)`, so status reports instead of rejecting. */
-async function lastMarkerText(deps: StatusDeps, target: TargetId, now: Date): Promise<string> {
+/** A target's marker: its time, none yet, or the redacted reason it cannot be read. */
+export type MarkerState =
+  | { kind: 'at'; at: Date }
+  | { kind: 'none' }
+  | { kind: 'unreadable'; reason: string };
+
+/** The marker of `target`; a marker that cannot be read (EACCES, EISDIR) is answered, not thrown. */
+export async function readMarkerState(deps: StatusDeps, target: TargetId, now: Date): Promise<MarkerState> {
   try {
     const marker = await deps.readMarker(target, now);
-    return marker === null ? 'never' : marker.toISOString();
+    return marker === null ? { kind: 'none' } : { kind: 'at', at: marker };
   } catch (err) {
-    return `unknown (${errorMessage(err)})`;
+    return { kind: 'unreadable', reason: errorMessage(err) };
   }
+}
+
+/** The "Last successful send"/"Last successful push" value for `target`: the marker time,
+ * `never`, or — when the marker cannot be read — `unknown (<redacted reason>)`. */
+async function lastMarkerText(deps: StatusDeps, target: TargetId, now: Date): Promise<string> {
+  const state = await readMarkerState(deps, target, now);
+  if (state.kind === 'none') return 'never';
+  return state.kind === 'at' ? state.at.toISOString() : `unknown (${state.reason})`;
 }
 
 /** `path` is a normalised posix-relative path within the repo; `undefined` means the repo
@@ -179,11 +201,16 @@ export async function runStatus(deps: StatusDeps): Promise<number> {
     return 0;
   }
 
-  const enabled = await deps.query();
+  const jobName = resolveSchedulerName(settings, process.platform);
+  const enabled: JobState = await deps.schedulerFor(jobName).query();
   const now = deps.now();
   const log = await deps.readLog();
 
   deps.print(`Analytics sync: ${enabled}`);
+  for (const line of deps.modeLines()) {
+    deps.print(line);
+  }
+  deps.print(`  OS job name:           ${jobName}`);
   if (enabled === 'disabled') {
     deps.print('  The OS job is missing or disabled outside the CLI. Run install again (the command your team lead shared):');
     deps.print('  codemie analytics sync install --webhook-b64 <value> | --webhook <url> | --git-repo <url>');
@@ -223,13 +250,12 @@ async function readSyncLog(): Promise<string | null> {
 }
 
 /** Real dependencies for `runStatus`: the real settings store, scheduler query, run log read
- * and marker read, and `console.log`. */
-export function createRealStatusDeps(): StatusDeps {
-  const scheduler = createScheduler(createRealSchedulerDeps());
-
+ * and marker read, `console.log`, and `modeLines` for the mode's own lines. */
+export function createRealStatusDeps(modeLines: StatusDeps['modeLines']): StatusDeps {
   return {
+    modeLines,
     loadSettings: () => loadSyncSettings(),
-    query: () => scheduler.query(),
+    schedulerFor: (name: string) => createScheduler(createRealSchedulerDeps(), name),
     readLog: readSyncLog,
     readMarker: (target: TargetId, now: Date) => readMarker(now, target === 'git' ? gitMarkerPath() : undefined),
     now: () => new Date(),

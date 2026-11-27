@@ -1,8 +1,8 @@
 import { logger } from '@/utils/logger.js';
 import { extractRepository } from '@/utils/paths.js';
-import { AnalyticsSourceError } from '@/utils/errors.js';
+import { AnalyticsSourceError, CodeMieError } from '@/utils/errors.js';
 import { boundedText, maskAndBoundFields, MAX_PROMPT_CHARS } from './otlp-field-limits.js';
-import { AgentAdapterType, type OtlpAdapterDeps } from './types.js';
+import { AgentAdapterType, type CollectionPolicy, type OtlpAdapterDeps } from './types.js';
 import { resolveRepoFields, type RepoFields } from './event-fields/repo-fields.js';
 import { resolveIdentityFields, resolveProjectAtCwd, type IdentityFields, type ProjectPolicy } from './event-fields/identity-fields.js';
 import { resolveBranchStory } from './story-resolver.js';
@@ -77,7 +77,25 @@ export abstract class OtlpAgentAdapter<TInput = unknown, TBlockOutput = Record<s
   }
   readonly type = AgentAdapterType.OTLP;
 
+  /** The policy of the `processOtlpEvent` call in progress. */
+  private activePolicy?: CollectionPolicy;
+
+  /** The collection policy of the hook being processed; only set inside `processOtlpEvent`. */
+  protected get policy(): CollectionPolicy {
+    if (!this.activePolicy) throw new CodeMieError(`[${this.name}] no collection policy outside processOtlpEvent`);
+    return this.activePolicy;
+  }
+
   public async processOtlpEvent(rawHookInput: string, deps: OtlpAdapterDeps): Promise<void> {
+    this.activePolicy = deps.policy;
+    try {
+      await this.processWithPolicy(rawHookInput, deps);
+    } finally {
+      this.activePolicy = undefined;
+    }
+  }
+
+  private async processWithPolicy(rawHookInput: string, deps: OtlpAdapterDeps): Promise<void> {
     const { ensureOtlpProxy, forwardOtlpEventsToSpool } = deps;
     // JSON.parse failures intentionally propagate to the caller.
     const hookInput = this.parseHookInput(rawHookInput);
@@ -95,12 +113,15 @@ export abstract class OtlpAgentAdapter<TInput = unknown, TBlockOutput = Record<s
     // data to the backend.
     if (!(await this.isTracked(hookInput))) {
       logger.debug(`[${this.name}] project not in analytics allowlist, ignoring hook event`);
-      await this.onUntrackedHook(hookInput);
+      await this.policy.onUntracked(this.sessionIdOf(hookInput), await this.untrackedByFilter(hookInput), () => this.onUntrackedHook(hookInput));
       return;
     }
 
-    // Per-hook session transition check (stop markers, folder / consent / generation changes). Adapters without one continue.
-    if ((await this.transitionGate(hookInput)) === 'stop') return;
+    // The policy decides whether the adapter's per-hook session transition check (stop markers, folder / consent /
+    // generation changes) runs: the backend policy runs it and answers what it answered, a deferred decision included;
+    // the local mode's policy never does. Adapters without one continue.
+    const transition = await this.policy.admit(this.sessionIdOf(hookInput), () => this.transitionGate(hookInput));
+    if (transition === 'stop') return;
 
     try {
       try {
@@ -110,6 +131,8 @@ export abstract class OtlpAgentAdapter<TInput = unknown, TBlockOutput = Record<s
         const message = error instanceof Error ? error.message : String(error);
         logger.warn(`[${this.name}] ensureOtlpProxy failed (non-blocking): ${message}`);
       }
+
+      if (transition === 'retry-after-proxy-start' && (await this.transitionGate(hookInput)) !== 'continue') return;
 
       const decision = await this.evaluate(hookInput);
       if (decision.decision === 'block') {
@@ -260,8 +283,8 @@ export abstract class OtlpAgentAdapter<TInput = unknown, TBlockOutput = Record<s
     throw err;
   }
 
-  /** Runs after the allowlist gate and before the daemon or any spool write. `stop`: nothing is spooled for this hook. */
-  protected async transitionGate(_input: TInput): Promise<'continue' | 'stop'> {
+  /** A deferred decision is checked once after the proxy start attempt and must allow the hook before any spool write. */
+  protected async transitionGate(_input: TInput): Promise<'continue' | 'stop' | 'retry-after-proxy-start'> {
     return 'continue';
   }
 
@@ -272,6 +295,19 @@ export abstract class OtlpAgentAdapter<TInput = unknown, TBlockOutput = Record<s
 
   /** Optional host-specific response when a recognized hook cannot be tracked. */
   protected async onUntrackedHook(_input: TInput): Promise<void> {}
+
+  /**
+   * Called after `isTracked` answered false: whether the developer's own filters (off, excluded, out of scope) left the
+   * hook out. An adapter without such filters answers false.
+   */
+  protected async untrackedByFilter(_input: TInput): Promise<boolean> {
+    return false;
+  }
+
+  /** The session id this adapter's events carry for the hook; none for an adapter that does not name one. */
+  protected sessionIdOf(_input: TInput): string | undefined {
+    return undefined;
+  }
 
   /** Enforcement adapters opt in; other adapters retain commit-after-send retry behavior. */
   protected requiresSpoolAcceptance(_input: TInput): boolean {

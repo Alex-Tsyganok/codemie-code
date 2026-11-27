@@ -1,13 +1,18 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { SyncGitError, SyncIdentityMissingError, SyncSchedulerUnsupportedError } from '@/utils/errors.js';
 import { getCodemiePath } from '@/utils/paths.js';
 
 import { runInstall } from '../install.js';
 import type { InstallDeps } from '../install.js';
+import { defaultSchedulerName } from '../scheduler/index.js';
 import type { RegisterResult, Scheduler } from '../scheduler/index.js';
 import { gitHint } from '../targets/git-client.js';
 import type { InstallOptions } from '../types.js';
+import type { InstallPlan, InstallStep } from '../../../shared/analytics-collection/types.js';
 
 const FAKE_WEBHOOK = 'https://hooks.example.invalid/abc?sig=SUPERSECRET123';
 const FAKE_GIT_REPO = 'https://example.invalid/team/repo.git';
@@ -18,6 +23,7 @@ function makeScheduler(overrides: Partial<Scheduler> = {}): Scheduler {
     register: vi.fn(async (): Promise<RegisterResult> => ({})),
     unregister: vi.fn(async () => false),
     query: vi.fn(async () => 'disabled' as const),
+    exists: vi.fn(async () => 'absent' as const),
     ...overrides,
   };
 }
@@ -47,7 +53,7 @@ function makeDeps(overrides: Partial<InstallDeps> & { scheduler?: Scheduler } = 
   const removeWorkingCopy = vi.fn(async () => {});
 
   const deps: InstallDeps = {
-    scheduler,
+    schedulerFor: () => scheduler,
     writeSettings,
     deleteSettings,
     readSettingsRaw: async () => null,
@@ -55,6 +61,8 @@ function makeDeps(overrides: Partial<InstallDeps> & { scheduler?: Scheduler } = 
     resolveIdentity: async () => 'dev@example.com',
     isTTY: false,
     promptEmail,
+    promptTaskName: async () => '',
+    confirmOverwrite: async () => false,
     saveUserEmail,
     collectorDirExists: () => false,
     resolveJobCommand: async () => ({
@@ -67,6 +75,7 @@ function makeDeps(overrides: Partial<InstallDeps> & { scheduler?: Scheduler } = 
     print: (line: string): void => {
       printed.push(line);
     },
+    plan: { steps: () => [], settingsExtras: () => ({}), conclude: () => ({ summary: [] }) },
     ...overrides,
   };
 
@@ -173,7 +182,7 @@ describe('runInstall', () => {
     expect(register).toHaveBeenLastCalledWith(expect.anything(), '05:30');
     const output = printed.join('\n');
     expect(output).toContain('Install failed: schtasks /Create failed: access denied');
-    expect(output).toContain('previous settings and daily job (05:30 local) were restored');
+    expect(output).toContain(`previous settings and daily job (${defaultSchedulerName(process.platform)} at 05:30 local) were restored`);
   });
 
   it('says delivery is stopped when the previous job cannot be registered again', async () => {
@@ -192,7 +201,7 @@ describe('runInstall', () => {
 
     expect(code).toBe(1);
     expect(restoreSettingsRaw).toHaveBeenCalledTimes(1);
-    expect(printed.join('\n')).toContain('Daily delivery is stopped on this machine until install succeeds.');
+    expect(printed.join('\n')).toContain('Daily delivery may be stopped on this machine until install succeeds.');
   });
 
   it('restores the previous settings and also the job when writing the new settings fails', async () => {
@@ -379,5 +388,513 @@ describe('runInstall — git target test push', () => {
     expect(output).toContain(FAKE_GIT_REPO);
     expect(output).toContain('reports');
     expect(output).toContain('analytics');
+  });
+});
+
+/** Name-aware scheduler stub: one scheduler per job name, created on first use. */
+function makeNamedSchedulers(configure: Record<string, Partial<Scheduler>> = {}): {
+  schedulerFor: (name: string) => Scheduler;
+  byName: Map<string, Scheduler>;
+} {
+  const byName = new Map<string, Scheduler>();
+  const schedulerFor = (name: string): Scheduler => {
+    let scheduler = byName.get(name);
+    if (scheduler === undefined) {
+      scheduler = makeScheduler(configure[name]);
+      byName.set(name, scheduler);
+    }
+    return scheduler;
+  };
+  return { schedulerFor, byName };
+}
+
+const CUSTOM_NAME = 'my-custom-task';
+const OLD_CUSTOM_NAME = 'old-custom-task';
+const DEFAULT_NAME = defaultSchedulerName(process.platform);
+
+function expectNothingChanged(harness: Harness, byName: Map<string, Scheduler>): void {
+  expect(harness.writeSettings).not.toHaveBeenCalled();
+  expect(harness.deleteSettings).not.toHaveBeenCalled();
+  expect(harness.restoreSettingsRaw).not.toHaveBeenCalled();
+  for (const scheduler of byName.values()) {
+    expect(scheduler.unregister).not.toHaveBeenCalled();
+    expect(scheduler.register).not.toHaveBeenCalled();
+  }
+}
+
+describe('runInstall — overwrite guard for --task-name', () => {
+  it('refuses without --force, prints the warning and changes nothing when a foreign task exists', async () => {
+    const { schedulerFor, byName } = makeNamedSchedulers({ [CUSTOM_NAME]: { exists: vi.fn(async () => 'present' as const) } });
+    const harness = makeDeps({ schedulerFor });
+
+    const code = await runInstall({ ...VALID_OPTS, taskName: CUSTOM_NAME }, harness.deps);
+
+    expect(code).toBe(1);
+    const output = harness.printed.join('\n');
+    expect(output).toContain(`The following task already exists and will be deleted and overwritten by this one: ${CUSTOM_NAME}`);
+    expect(output).toContain('Re-run with --force');
+    expectNothingChanged(harness, byName);
+  });
+
+  it('refuses without --force when the presence check is unknown', async () => {
+    const { schedulerFor, byName } = makeNamedSchedulers({ [CUSTOM_NAME]: { exists: vi.fn(async () => 'unknown' as const) } });
+    const harness = makeDeps({ schedulerFor });
+
+    const code = await runInstall({ ...VALID_OPTS, taskName: CUSTOM_NAME }, harness.deps);
+
+    expect(code).toBe(1);
+    expect(harness.printed.join('\n')).toContain(`Could not check whether a scheduler task named "${CUSTOM_NAME}" already exists`);
+    expectNothingChanged(harness, byName);
+  });
+
+  it('treats a throwing presence check like unknown', async () => {
+    const { schedulerFor, byName } = makeNamedSchedulers({
+      [CUSTOM_NAME]: {
+        exists: vi.fn(async () => {
+          throw new Error('probe failed');
+        })
+      }
+    });
+    const harness = makeDeps({ schedulerFor });
+
+    const code = await runInstall({ ...VALID_OPTS, taskName: CUSTOM_NAME }, harness.deps);
+
+    expect(code).toBe(1);
+    expectNothingChanged(harness, byName);
+  });
+
+  it('goes ahead with --force, still printing the warning, and saves the custom name', async () => {
+    const { schedulerFor, byName } = makeNamedSchedulers({ [CUSTOM_NAME]: { exists: vi.fn(async () => 'present' as const) } });
+    const harness = makeDeps({ schedulerFor });
+
+    const code = await runInstall({ ...VALID_OPTS, taskName: CUSTOM_NAME, force: true }, harness.deps);
+
+    expect(code).toBe(0);
+    expect(harness.printed.join('\n')).toContain('will be deleted and overwritten');
+    expect(harness.writeSettings).toHaveBeenCalledWith(expect.objectContaining({ taskName: CUSTOM_NAME }));
+    expect(byName.get(CUSTOM_NAME)?.register).toHaveBeenCalledTimes(1);
+  });
+
+  it('proceeds silently when no task with that name exists', async () => {
+    const { schedulerFor, byName } = makeNamedSchedulers();
+    const harness = makeDeps({ schedulerFor });
+
+    const code = await runInstall({ ...VALID_OPTS, taskName: CUSTOM_NAME }, harness.deps);
+
+    expect(code).toBe(0);
+    expect(harness.printed.join('\n')).not.toContain('overwritten');
+    expect(byName.get(CUSTOM_NAME)?.register).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not ask when --task-name is given on a terminal: the flag needs --force', async () => {
+    const confirmOverwrite = vi.fn(async () => true);
+    const { schedulerFor, byName } = makeNamedSchedulers({ [CUSTOM_NAME]: { exists: vi.fn(async () => 'present' as const) } });
+    const harness = makeDeps({ schedulerFor, isTTY: true, confirmOverwrite });
+
+    const code = await runInstall({ ...VALID_OPTS, taskName: CUSTOM_NAME }, harness.deps);
+
+    expect(code).toBe(1);
+    expect(confirmOverwrite).not.toHaveBeenCalled();
+    expectNothingChanged(harness, byName);
+  });
+
+  it('overwrites a foreign task when a name typed at the prompt is confirmed', async () => {
+    const confirmOverwrite = vi.fn(async () => true);
+    const { schedulerFor, byName } = makeNamedSchedulers({ [CUSTOM_NAME]: { exists: vi.fn(async () => 'present' as const) } });
+    const harness = makeDeps({ schedulerFor, isTTY: true, promptTaskName: async () => CUSTOM_NAME, confirmOverwrite });
+
+    const code = await runInstall(VALID_OPTS, harness.deps);
+
+    expect(code).toBe(0);
+    expect(confirmOverwrite).toHaveBeenCalledWith(CUSTOM_NAME);
+    expect(byName.get(CUSTOM_NAME)?.register).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels and changes nothing when the prompted overwrite is declined', async () => {
+    const confirmOverwrite = vi.fn(async () => false);
+    const { schedulerFor, byName } = makeNamedSchedulers({ [CUSTOM_NAME]: { exists: vi.fn(async () => 'present' as const) } });
+    const harness = makeDeps({ schedulerFor, isTTY: true, promptTaskName: async () => CUSTOM_NAME, confirmOverwrite });
+
+    const code = await runInstall(VALID_OPTS, harness.deps);
+
+    expect(code).toBe(1);
+    expect(confirmOverwrite).toHaveBeenCalledTimes(1);
+    expect(harness.printed.join('\n')).toContain('Install cancelled');
+    expectNothingChanged(harness, byName);
+  });
+
+  it('skips the presence check when the name equals the saved name', async () => {
+    const exists = vi.fn(async () => 'present' as const);
+    const { schedulerFor, byName } = makeNamedSchedulers({ [CUSTOM_NAME]: { exists } });
+    const harness = makeDeps({
+      schedulerFor,
+      readSettingsRaw: async () => JSON.stringify({ webhookUrl: 'https://old.example.invalid/x', taskName: CUSTOM_NAME })
+    });
+
+    const code = await runInstall({ ...VALID_OPTS, taskName: CUSTOM_NAME }, harness.deps);
+
+    expect(code).toBe(0);
+    expect(exists).not.toHaveBeenCalled();
+    expect(harness.printed.join('\n')).not.toContain('overwritten');
+    expect(byName.get(CUSTOM_NAME)?.register).toHaveBeenCalledTimes(1);
+  });
+
+  it('still checks presence when the saved name differs from the chosen one', async () => {
+    const exists = vi.fn(async () => 'present' as const);
+    const { schedulerFor, byName } = makeNamedSchedulers({ [CUSTOM_NAME]: { exists } });
+    const harness = makeDeps({
+      schedulerFor,
+      readSettingsRaw: async () => JSON.stringify({ webhookUrl: 'https://old.example.invalid/x', taskName: OLD_CUSTOM_NAME })
+    });
+
+    const code = await runInstall({ ...VALID_OPTS, taskName: CUSTOM_NAME }, harness.deps);
+
+    expect(code).toBe(1);
+    expect(exists).toHaveBeenCalledTimes(1);
+    expectNothingChanged(harness, byName);
+  });
+
+  it('rejects an invalid --task-name before touching anything', async () => {
+    const { schedulerFor, byName } = makeNamedSchedulers();
+    const harness = makeDeps({ schedulerFor });
+
+    const code = await runInstall({ ...VALID_OPTS, taskName: '../evil' }, harness.deps);
+
+    expect(code).toBe(1);
+    expect(harness.printed.join('\n')).toContain('Install failed');
+    expectNothingChanged(harness, byName);
+  });
+});
+
+describe('runInstall — default name is not saved', () => {
+  it('does not store taskName or check presence when --task-name equals the platform default', async () => {
+    const exists = vi.fn(async () => 'present' as const);
+    const { schedulerFor, byName } = makeNamedSchedulers({ [DEFAULT_NAME]: { exists } });
+    const harness = makeDeps({ schedulerFor });
+
+    const code = await runInstall({ ...VALID_OPTS, taskName: DEFAULT_NAME }, harness.deps);
+
+    expect(code).toBe(0);
+    expect(exists).not.toHaveBeenCalled();
+    const written = harness.writeSettings.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(written).not.toHaveProperty('taskName');
+    expect(byName.get(DEFAULT_NAME)?.register).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the default and stores no name when the prompt answer is empty', async () => {
+    const promptTaskName = vi.fn(async () => '');
+    const { schedulerFor } = makeNamedSchedulers();
+    const harness = makeDeps({ schedulerFor, isTTY: true, promptTaskName });
+
+    const code = await runInstall(VALID_OPTS, harness.deps);
+
+    expect(code).toBe(0);
+    expect(promptTaskName).toHaveBeenCalledWith(DEFAULT_NAME);
+    expect(harness.writeSettings.mock.calls[0]?.[0] as Record<string, unknown>).not.toHaveProperty('taskName');
+  });
+
+  it('never prompts when --task-name is given', async () => {
+    const promptTaskName = vi.fn(async () => '');
+    const { schedulerFor } = makeNamedSchedulers();
+    const harness = makeDeps({ schedulerFor, isTTY: true, promptTaskName });
+
+    await runInstall({ ...VALID_OPTS, taskName: CUSTOM_NAME }, harness.deps);
+
+    expect(promptTaskName).not.toHaveBeenCalled();
+  });
+});
+
+describe('runInstall — replacing and restoring jobs under saved names', () => {
+  const previousRaw = JSON.stringify({
+    webhookUrl: 'https://old.example.invalid/x?sig=OLD',
+    at: '05:30',
+    taskName: OLD_CUSTOM_NAME
+  });
+  const enabled = { query: vi.fn(async () => 'enabled' as const) };
+
+  it('unregisters both owned names before registering the new name', async () => {
+    const calls: string[] = [];
+    const track = (name: string): Partial<Scheduler> => ({
+      query: vi.fn(async () => 'enabled' as const),
+      unregister: vi.fn(async () => {
+        calls.push(`unregister:${name}`);
+        return true;
+      }),
+      register: vi.fn(async (): Promise<RegisterResult> => {
+        calls.push(`register:${name}`);
+        return {};
+      })
+    });
+    const { schedulerFor } = makeNamedSchedulers({
+      [OLD_CUSTOM_NAME]: track(OLD_CUSTOM_NAME),
+      [DEFAULT_NAME]: track(DEFAULT_NAME),
+      [CUSTOM_NAME]: track(CUSTOM_NAME)
+    });
+    const harness = makeDeps({ schedulerFor, readSettingsRaw: async () => previousRaw });
+
+    const code = await runInstall({ ...VALID_OPTS, taskName: CUSTOM_NAME, force: true }, harness.deps);
+
+    expect(code).toBe(0);
+    expect(calls).toEqual([`unregister:${OLD_CUSTOM_NAME}`, `unregister:${DEFAULT_NAME}`, `register:${CUSTOM_NAME}`]);
+  });
+
+  it('re-registers every previously enabled job under its own name and schedule when registration fails', async () => {
+    const { schedulerFor, byName } = makeNamedSchedulers({
+      [OLD_CUSTOM_NAME]: { ...enabled },
+      [DEFAULT_NAME]: { ...enabled },
+      [CUSTOM_NAME]: {
+        register: vi.fn(async () => {
+          throw new Error('launchctl bootstrap failed: boom');
+        })
+      }
+    });
+    const harness = makeDeps({ schedulerFor, readSettingsRaw: async () => previousRaw });
+
+    const code = await runInstall({ ...VALID_OPTS, taskName: CUSTOM_NAME, force: true }, harness.deps);
+
+    expect(code).toBe(1);
+    expect(byName.get(CUSTOM_NAME)?.unregister).toHaveBeenCalledTimes(1); // rollback of the new name
+    expect(harness.restoreSettingsRaw).toHaveBeenCalledWith(previousRaw);
+    expect(byName.get(OLD_CUSTOM_NAME)?.register).toHaveBeenCalledWith(expect.anything(), '05:30');
+    expect(byName.get(DEFAULT_NAME)?.register).toHaveBeenCalledWith(expect.anything(), '05:30');
+    const output = harness.printed.join('\n');
+    expect(output).toContain(`${OLD_CUSTOM_NAME} at 05:30 local`);
+    expect(output).toContain(`${DEFAULT_NAME} at 05:30 local`);
+  });
+
+  it('restores only the jobs that were enabled', async () => {
+    const { schedulerFor, byName } = makeNamedSchedulers({
+      [OLD_CUSTOM_NAME]: { ...enabled },
+      [CUSTOM_NAME]: {
+        register: vi.fn(async () => {
+          throw new Error('boom');
+        })
+      }
+    });
+    const harness = makeDeps({ schedulerFor, readSettingsRaw: async () => previousRaw });
+
+    const code = await runInstall({ ...VALID_OPTS, taskName: CUSTOM_NAME, force: true }, harness.deps);
+
+    expect(code).toBe(1);
+    expect(byName.get(OLD_CUSTOM_NAME)?.register).toHaveBeenCalledTimes(1);
+    expect(byName.get(DEFAULT_NAME)?.register).not.toHaveBeenCalled();
+  });
+
+  it('ignores an invalid saved name: only the default name is owned and touched', async () => {
+    const { schedulerFor, byName } = makeNamedSchedulers();
+    const harness = makeDeps({
+      schedulerFor,
+      readSettingsRaw: async () => JSON.stringify({ webhookUrl: 'https://old.example.invalid/x', taskName: '../../etc/evil' })
+    });
+
+    const code = await runInstall({ ...VALID_OPTS, taskName: CUSTOM_NAME }, harness.deps);
+
+    expect(code).toBe(0);
+    expect([...byName.keys()].sort()).toEqual([CUSTOM_NAME, DEFAULT_NAME].sort());
+  });
+});
+
+describe('runInstall — install plan', () => {
+  const previousRaw = JSON.stringify({ webhookUrl: 'https://old.example.invalid/x?sig=OLD', at: '04:30' });
+
+  /** A step that records its apply and undo in `events`; `onApply` runs inside its apply. */
+  function recordingStep(name: string, events: string[], onApply?: () => void, undoError?: Error): InstallStep {
+    return {
+      name,
+      apply: async () => {
+        events.push(`apply:${name}`);
+        onApply?.();
+        return { name, state: 'done' };
+      },
+      undo: async () => {
+        events.push(`undo:${name}`);
+        if (undoError) throw undoError;
+      },
+    };
+  }
+
+  function plan(steps: InstallStep[], conclude: InstallPlan['conclude'] = () => ({ summary: ['  Mode:             test'] })): InstallPlan {
+    return {
+      steps: () => steps,
+      settingsExtras: (job) => ({ local: true, localJob: { node: job.node, entry: job.entry } }),
+      conclude,
+    };
+  }
+
+  it('runs the steps before the job is replaced, writes the plan\'s extras and prints its summary', async () => {
+    const events: string[] = [];
+    const scheduler = makeScheduler({
+      register: vi.fn(async (): Promise<RegisterResult> => {
+        events.push('register');
+        return {};
+      }),
+    });
+    const harness = makeDeps({ scheduler, plan: plan([recordingStep('a', events), recordingStep('b', events)]) });
+    harness.writeSettings.mockImplementation(async () => {
+      events.push('write');
+    });
+
+    const code = await runInstall(VALID_OPTS, harness.deps);
+
+    expect(code).toBe(0);
+    expect(events).toEqual(['apply:a', 'apply:b', 'write', 'register']);
+    expect(harness.writeSettings).toHaveBeenCalledWith(expect.objectContaining({
+      webhookUrl: FAKE_WEBHOOK,
+      local: true,
+      localJob: { node: '/usr/bin/node', entry: '/home/dev/.codemie/bin/codemie.js' },
+    }));
+    expect(harness.printed).toContain('  Mode:             test');
+  });
+
+  it('a failure the plan concludes undoes the applied steps in reverse, registers nothing and exits 1', async () => {
+    const events: string[] = [];
+    const harness = makeDeps({
+      plan: plan([recordingStep('a', events), recordingStep('b', events)], () => ({ summary: [], failure: 'No supported client could be set up.' })),
+    });
+
+    const code = await runInstall(VALID_OPTS, harness.deps);
+
+    expect(code).toBe(1);
+    expect(events).toEqual(['apply:a', 'apply:b', 'undo:b', 'undo:a']);
+    expect(harness.scheduler.register).not.toHaveBeenCalled();
+    expect(harness.writeSettings).not.toHaveBeenCalled();
+    expect(harness.printed).toContain('No supported client could be set up.');
+  });
+
+  it('a plan that stands down undoes its steps in reverse, saves none of its extras, prints its summary and exits 0', async () => {
+    const events: string[] = [];
+    const scheduler = makeScheduler({
+      register: vi.fn(async (): Promise<RegisterResult> => {
+        events.push('register');
+        return {};
+      }),
+    });
+    const harness = makeDeps({
+      scheduler,
+      plan: plan([recordingStep('a', events), recordingStep('b', events)], () => ({ summary: ['  Local mode:       not turned on'], standDown: { undoFailed: 'the stub plan could not be undone' } })),
+    });
+
+    const code = await runInstall(VALID_OPTS, harness.deps);
+
+    expect(code).toBe(0);
+    expect(events).toEqual(['apply:a', 'apply:b', 'undo:b', 'undo:a', 'register']);
+    expect(harness.writeSettings).toHaveBeenCalledWith(expect.objectContaining({ webhookUrl: FAKE_WEBHOOK }));
+    for (const [written] of harness.writeSettings.mock.calls) {
+      expect(written).not.toHaveProperty('local');
+      expect(written).not.toHaveProperty('localJob');
+    }
+    expect(harness.printed).toContain('  Local mode:       not turned on');
+  });
+
+  it('a plan that stands down with an undo that throws fails: both lines printed, nothing registered or written, exit 1', async () => {
+    const events: string[] = [];
+    const harness = makeDeps({
+      plan: plan(
+        [recordingStep('a', events), recordingStep('b', events, undefined, new Error('settings locked'))],
+        () => ({ summary: ['  Local mode:       not turned on'], standDown: { undoFailed: 'the stub plan could not be undone' } })
+      ),
+    });
+
+    const code = await runInstall(VALID_OPTS, harness.deps);
+
+    expect(code).toBe(1);
+    expect(events).toEqual(['apply:a', 'apply:b', 'undo:b', 'undo:a']);
+    expect(harness.printed).toContain('Could not undo "b": settings locked');
+    expect(harness.printed).toContain('Install failed: the stub plan could not be undone');
+    expect(harness.scheduler.register).not.toHaveBeenCalled();
+    expect(harness.writeSettings).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['settings there before: restored', previousRaw],
+    ['no settings before: deleted', null],
+  ])('a plan that stands down whose register throws fails and puts back the install of before (%s)', async (_name, before) => {
+    const events: string[] = [];
+    const register = vi.fn(async (): Promise<RegisterResult> => {
+      throw new Error('launchctl bootstrap failed: boom');
+    });
+    const harness = makeDeps({
+      scheduler: makeScheduler({ register }),
+      readSettingsRaw: async () => before,
+      plan: plan([recordingStep('a', events)], () => ({ summary: ['  Local mode:       not turned on'], standDown: { undoFailed: 'the stub plan could not be undone' } })),
+    });
+
+    const code = await runInstall(VALID_OPTS, harness.deps);
+
+    expect(code).toBe(1);
+    expect(events).toEqual(['apply:a', 'undo:a']);
+    expect(harness.printed).toContain('Install failed: launchctl bootstrap failed: boom');
+    if (before === null) {
+      expect(harness.deleteSettings).toHaveBeenCalled();
+      expect(harness.restoreSettingsRaw).not.toHaveBeenCalled();
+    } else {
+      expect(harness.restoreSettingsRaw).toHaveBeenCalledWith(previousRaw);
+    }
+  });
+
+  it('a register that throws undoes the steps in reverse and restores the settings and the job of before the run', async () => {
+    const events: string[] = [];
+    let stored = previousRaw;
+    const register = vi.fn(async (): Promise<RegisterResult> => ({}))
+      .mockRejectedValueOnce(new Error('launchctl bootstrap failed: boom'));
+    const scheduler = makeScheduler({ register, query: vi.fn(async () => 'enabled' as const) });
+    // The first step writes the settings of this install, as the local mode's does.
+    const step = recordingStep('settings', events, () => {
+      stored = JSON.stringify({ webhookUrl: FAKE_WEBHOOK, at: '03:00', local: true });
+    });
+    const harness = makeDeps({ scheduler, readSettingsRaw: async () => stored, plan: plan([step, recordingStep('daemon', events)]) });
+
+    const code = await runInstall(VALID_OPTS, harness.deps);
+
+    expect(code).toBe(1);
+    expect(events).toEqual(['apply:settings', 'apply:daemon', 'undo:daemon', 'undo:settings']);
+    expect(harness.restoreSettingsRaw).toHaveBeenCalledWith(previousRaw);
+    expect(register).toHaveBeenLastCalledWith(expect.anything(), '04:30');
+  });
+
+  it('an undo that throws is printed and the earlier steps are still undone', async () => {
+    const events: string[] = [];
+    const harness = makeDeps({
+      plan: plan(
+        [recordingStep('a', events), recordingStep('b', events, undefined, new Error('settings locked'))],
+        () => ({ summary: [], failure: 'stop' })
+      ),
+    });
+
+    const code = await runInstall(VALID_OPTS, harness.deps);
+
+    expect(code).toBe(1);
+    expect(events).toEqual(['apply:a', 'apply:b', 'undo:b', 'undo:a']);
+    expect(harness.printed).toContain('Could not undo "b": settings locked');
+  });
+});
+
+describe('runInstall — over a settings file that is not JSON', () => {
+  let home: string;
+  beforeEach(async () => {
+    home = await mkdtemp(join(tmpdir(), 'install-corrupt-'));
+    vi.stubEnv('CODEMIE_HOME', home);
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await (await import('@/utils/logger.js')).logger.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  it('completes and writes the new settings', async () => {
+    await writeFile(join(home, 'analytics-sync.json'), '{not json');
+    const store = await import('../config-store.js');
+    const previous = await store.loadSyncSettings().catch(() => null);
+    const harness = makeDeps({
+      readSettingsRaw: () => store.readSyncSettingsRaw(),
+      writeSettings: (settings) => store.writeSyncSettings(settings),
+      restoreSettingsRaw: (raw) => store.restoreSyncSettingsRaw(raw),
+    });
+
+    const code = await runInstall(VALID_OPTS, harness.deps);
+
+    expect(previous).toBeNull();
+    expect(code).toBe(0);
+    expect(await store.loadSyncSettings()).toMatchObject({ webhookUrl: FAKE_WEBHOOK });
   });
 });

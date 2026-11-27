@@ -7,6 +7,7 @@
  * is mocked so results are deterministic and no real process/network/fs probing occurs.
  */
 
+import { backendDoctorPlan } from '../../../proxy/doctor/backend-plan.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { AuthMethod } from '@/providers/core/types.js';
 
@@ -20,6 +21,7 @@ const h = vi.hoisted(() => ({
   resolveEnvVarMock: vi.fn(),
   getProviderMock: vi.fn(),
   getInstalledAgentsMock: vi.fn(),
+  getManageableAgentsMock: vi.fn(),
   getAllFrameworksMock: vi.fn(),
   detectVCSMock: vi.fn(),
   listWorkflowsMock: vi.fn(),
@@ -69,6 +71,7 @@ vi.mock('@/providers/core/registry.js', async (importOriginal) => {
 vi.mock('@/agents/registry.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/agents/registry.js')>();
   (actual.AgentRegistry as unknown as Record<string, unknown>).getInstalledAgents = h.getInstalledAgentsMock;
+  (actual.AgentRegistry as unknown as Record<string, unknown>).getManageableAgents = h.getManageableAgentsMock;
   return actual;
 });
 
@@ -121,6 +124,7 @@ function fakeJwt(exp?: number): string {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  h.getManageableAgentsMock.mockReturnValue([]);
 });
 
 afterEach(() => {
@@ -312,6 +316,101 @@ describe('AgentsCheck', () => {
     const result = await new AgentsCheck().run();
     expect(result.details[0].status).toBe('warn');
     expect(result.details[0].message).toContain('installed via npm (deprecated');
+  });
+
+  describe('PATH shadow', () => {
+    // AgentsCheck splits the active path with the host platform's path module, so the fixture must use host separators.
+    const sep = process.platform === 'win32' ? '\\' : '/';
+    const oldDir = process.platform === 'win32' ? 'C:\\old\\bin' : '/old/bin';
+    const activePath = `${oldDir}${sep}claude.cmd`;
+    const shadowed = { status: 'shadowed', active: activePath, managedDir: 'C:\\managed\\bin' };
+    const missingOnPath = { status: 'missing-on-path', managedDir: 'C:\\managed\\bin', shimPath: 'C:\\managed\\bin\\codex.cmd' };
+    const agent = (name: string, verdict: unknown) => ({
+      name,
+      displayName: name,
+      getVersion: async () => '1.0.0',
+      checkPathShadow: vi.fn(async () => verdict),
+    });
+
+    beforeEach(() => {
+      h.getManageableAgentsMock.mockReturnValue([]);
+    });
+
+    it('warns with a put-ahead hint for a shadowed installed agent', async () => {
+      h.getInstalledAgentsMock.mockResolvedValue([agent('claude', shadowed)]);
+      const result = await new AgentsCheck().run();
+      expect(result.success).toBe(true);
+      expect(result.details).toHaveLength(1);
+      expect(result.details[0].status).toBe('warn');
+      expect(result.details[0].message).toContain('claude (1.0.0)');
+      expect(result.details[0].message).toContain(activePath);
+      expect(result.details[0].hint).toBe(`  - Put "C:\\managed\\bin" ahead of "${oldDir}" on your PATH`);
+    });
+
+    it('appends the version warning to a shadowed agent message', async () => {
+      h.getInstalledAgentsMock.mockResolvedValue([
+        {
+          ...agent('claude', shadowed),
+          checkVersionCompatibility: async () => ({ isSupported: false, isBelowMinimum: false, supportedVersion: '2.0.0' }),
+        },
+      ]);
+      const result = await new AgentsCheck().run();
+      expect(result.details[0].status).toBe('warn');
+      expect(result.details[0].message).toContain('CodeMie recommends v2.0.0');
+    });
+
+    it('warns with the add-to-PATH hint for a missing-on-path agent that is not installed', async () => {
+      h.getInstalledAgentsMock.mockResolvedValue([]);
+      h.getManageableAgentsMock.mockReturnValue([agent('codex', missingOnPath)]);
+      const result = await new AgentsCheck().run();
+      const warn = result.details.find((d) => d.status === 'warn');
+      expect(warn?.message).toContain('codex');
+      expect(warn?.hint).toContain('Add "C:\\managed\\bin" to your PATH');
+    });
+
+    it('does not re-check installed agents among the not-installed ones', async () => {
+      const installed = agent('claude', { status: 'clear' });
+      h.getInstalledAgentsMock.mockResolvedValue([installed]);
+      h.getManageableAgentsMock.mockReturnValue([installed]);
+      await new AgentsCheck().run();
+      expect(installed.checkPathShadow).toHaveBeenCalledTimes(1);
+      expect(installed.checkPathShadow).toHaveBeenCalledWith();
+    });
+
+    it.each([['clear'], ['missing'], ['unknown']])('leaves results unchanged for %s', async (status) => {
+      h.getInstalledAgentsMock.mockResolvedValue([agent('claude', { status })]);
+      h.getManageableAgentsMock.mockReturnValue([agent('codex', { status })]);
+      const result = await new AgentsCheck().run();
+      expect(result.details).toEqual([{ status: 'ok', message: 'claude (1.0.0)' }]);
+    });
+
+    it('treats a throwing or hanging check as unknown', async () => {
+      vi.useFakeTimers();
+      try {
+        h.getInstalledAgentsMock.mockResolvedValue([]);
+        h.getManageableAgentsMock.mockReturnValue([
+          { name: 'a', displayName: 'a', checkPathShadow: async () => { throw new Error('x'); } },
+          { name: 'b', displayName: 'b', checkPathShadow: () => new Promise(() => undefined) },
+        ]);
+        const pending = new AgentsCheck().run();
+        await vi.advanceTimersByTimeAsync(5000);
+        const result = await pending;
+        expect(result.details).toEqual([
+          { status: 'info', message: 'No agents installed (CodeMie Code is built-in)' },
+        ]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('runWithItemDisplay reports the same warnings', async () => {
+      h.getInstalledAgentsMock.mockResolvedValue([agent('claude', shadowed)]);
+      h.getManageableAgentsMock.mockReturnValue([agent('codex', missingOnPath)]);
+      const displayed: Array<{ status: string }> = [];
+      const result = await new AgentsCheck().runWithItemDisplay(() => undefined, (d) => displayed.push(d));
+      expect(displayed.map((d) => d.status)).toEqual(['warn', 'warn']);
+      expect(result.details).toHaveLength(2);
+    });
   });
 
   it('runWithItemDisplay emits start + display callbacks per agent', async () => {
@@ -597,8 +696,8 @@ describe('NpmPrefixOverrideCheck', () => {
 describe('ProxyCheck', () => {
   it('composes without the auth probe', async () => {
     h.composeMock.mockResolvedValue({ sections: [{ id: 'daemon', status: 'ok', message: 'running' }], nothingConnected: false });
-    const result = await new ProxyCheck().run();
-    expect(h.composeMock).toHaveBeenCalledWith({ authProbe: false, verbose: false });
+    const result = await new ProxyCheck(backendDoctorPlan).run();
+    expect(h.composeMock).toHaveBeenCalledWith({ authProbe: false, verbose: false, plan: backendDoctorPlan });
     expect(result.name).toBe('Proxy');
     expect(result.success).toBe(true);
     expect(result.details).toEqual([
@@ -607,17 +706,49 @@ describe('ProxyCheck', () => {
     ]);
   });
 
+  it('in the local mode composes with the local plan', async () => {
+    const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const home = await mkdtemp(join(tmpdir(), 'proxy-check-local-'));
+    vi.stubEnv('CODEMIE_HOME', home);
+    try {
+      await writeFile(join(home, 'analytics-sync.json'), JSON.stringify({
+        webhookUrl: 'https://hooks.example.invalid/x?sig=FAKE', format: 'json', includeExternal: 'never', at: '03:00', local: true,
+      }));
+      h.composeMock.mockResolvedValue({ sections: [{ id: 'local', status: 'ok', message: 'Local analytics folder: 0 sessions' }], nothingConnected: false });
+
+      const { resolveCollection } = await import('@/cli/commands/shared/analytics-collection/resolve.js');
+      const localPlan = (await resolveCollection()).doctor;
+
+      const result = await new ProxyCheck(localPlan).run();
+
+      const { plan, authProbe } = h.composeMock.mock.calls.at(-1)?.[0] as { plan: { daemonLabel: () => string }; authProbe: boolean };
+      expect(authProbe).toBe(false);
+      expect(plan.daemonLabel()).toBe('local analytics mode');
+      expect(result.details[0]).toEqual({ status: 'ok', message: 'Local analytics folder: 0 sessions' });
+
+      // The check composes with the plan it is handed, whatever mode this machine is in.
+      await new ProxyCheck(backendDoctorPlan).run();
+      expect(h.composeMock.mock.calls.at(-1)?.[0]).toEqual({ authProbe: false, verbose: false, plan: backendDoctorPlan });
+    } finally {
+      vi.unstubAllEnvs();
+      await (await import('@/utils/logger.js')).logger.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   it('ends with a pointer to codemie proxy doctor for the full report', async () => {
     h.composeMock.mockResolvedValue({ sections: [{ id: 'clients', status: 'warn', message: 'w', hint: 'h' }], nothingConnected: false });
-    const result = await new ProxyCheck().run();
+    const result = await new ProxyCheck(backendDoctorPlan).run();
     expect(result.details.at(-1)).toEqual({ status: 'info', message: 'Full report: codemie proxy doctor' });
   });
 
   it('fails only on an error section, not on a warning', async () => {
     h.composeMock.mockResolvedValue({ sections: [{ id: 'clients', status: 'warn', message: 'w', hint: 'h' }], nothingConnected: false });
-    expect((await new ProxyCheck().run()).success).toBe(true);
+    expect((await new ProxyCheck(backendDoctorPlan).run()).success).toBe(true);
     h.composeMock.mockResolvedValue({ sections: [{ id: 'auth', status: 'error', message: 'e' }], nothingConnected: false });
-    expect((await new ProxyCheck().run()).success).toBe(false);
+    expect((await new ProxyCheck(backendDoctorPlan).run()).success).toBe(false);
   });
 
   it('reports a single info line when nothing is connected', async () => {
@@ -625,14 +756,23 @@ describe('ProxyCheck', () => {
       sections: [{ id: 'clients', status: 'warn', message: 'nothing is connected', hint: 'run: codemie proxy connect' }],
       nothingConnected: true,
     });
-    const result = await new ProxyCheck().run();
+    const result = await new ProxyCheck(backendDoctorPlan).run();
     expect(result.success).toBe(true);
     expect(result.details.every((d) => d.status === 'info' || d.status === 'ok')).toBe(true);
   });
 
+  it('fails with the error of a collection that did not resolve, ending with the full-report pointer', async () => {
+    const result = await new ProxyCheck(new Error('sync settings unreadable')).run();
+    expect(result.success).toBe(false);
+    expect(result.details).toEqual([
+      { status: 'error', message: 'Proxy check failed: sync settings unreadable' },
+      { status: 'info', message: 'Full report: codemie proxy doctor' },
+    ]);
+  });
+
   it('never rejects: a thrown compose becomes an error detail', async () => {
     h.composeMock.mockRejectedValue(new Error('boom'));
-    const result = await new ProxyCheck().run();
+    const result = await new ProxyCheck(backendDoctorPlan).run();
     expect(result.success).toBe(false);
     expect(result.details[0].status).toBe('error');
     expect(result.details[0].message).toContain('boom');

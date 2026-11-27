@@ -3,8 +3,12 @@
  * read it, so they agree on what is connected.
  * @group unit
  */
+import { backendDoctorPlan } from '../doctor/backend-plan.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { stripVTControlCharacters } from 'node:util';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 vi.mock('@/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), success: vi.fn() },
@@ -30,13 +34,19 @@ vi.mock('../daemon-manager.js', async (importOriginal) => ({
 }));
 
 // Fixture: Claude Desktop and Claude Code are connected; nothing else is.
+const APPLIED_DESKTOP_GATEWAY = { port: 4001, apiKey: 'secret-gateway-key.claude-desktop' };
+const desktopReads = vi.hoisted(() => ({
+  applied: vi.fn(),
+  codemie: vi.fn(),
+}));
 vi.mock('@/telemetry/clients/claude-desktop/claude-desktop.gateway.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/telemetry/clients/claude-desktop/claude-desktop.gateway.js')>()),
-  readDesktopGatewayConfig: async () => ({ port: 4001, apiKey: 'secret-gateway-key.claude-desktop' }),
+  readDesktopGatewayConfig: (...args: unknown[]) => desktopReads.applied(...args),
 }));
 vi.mock('../connectors/desktop.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../connectors/desktop.js')>()),
   readDesktopGateway: async () => ({ port: 4001 }),
+  readCodeMieDesktopGateway: (...args: unknown[]) => desktopReads.codemie(...args),
 }));
 vi.mock('../connectors/vscode-claude-code.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../connectors/vscode-claude-code.js')>()),
@@ -162,6 +172,8 @@ describe('client-target table', () => {
       logs.push(args.map(String).join(' '));
     });
     readDaemonStatus.mockResolvedValue({ running: true, state: STATE });
+    desktopReads.applied.mockReset().mockResolvedValue(APPLIED_DESKTOP_GATEWAY);
+    desktopReads.codemie.mockReset().mockResolvedValue(null);
     collectAnalyticsClients.mockResolvedValue(ANALYTICS_ROWS);
     originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn(async () => ({
@@ -212,12 +224,28 @@ describe('client-target table', () => {
     expect((await listConnectedClientTargets()).map((target) => target.id)).toEqual(connected.map((row) => row.id));
 
     const { composeProxyDoctor } = await import('../doctor/compose.js');
-    const report = await composeProxyDoctor({ authProbe: false, verbose: false });
+    const report = await composeProxyDoctor({ authProbe: false, verbose: false, plan: backendDoctorPlan });
     const clients = report.sections.filter((section) => section.id === 'clients');
     expect(clients).toEqual([
       { id: 'clients', status: 'ok', message: `Clients connected: ${connected.map((row) => row.label).join(', ')}` },
     ]);
     expect(report.nothingConnected).toBe(false);
+  });
+
+  it('Claude Desktop reads as connected for disconnect --all when only the non-applied CodeMie Proxy entry is CodeMie\'s', async () => {
+    const { CLIENT_TARGETS, listConnectedClientTargets } = await import('../client-targets.js');
+    const desktop = CLIENT_TARGETS.find((target) => target.id === 'claude-desktop');
+    // A foreign config is applied: the applied reader sees no loopback gateway.
+    desktopReads.applied.mockResolvedValue(null);
+
+    desktopReads.codemie.mockResolvedValue(null);
+    expect(await desktop?.isConnected()).toBe(false);
+
+    desktopReads.codemie.mockResolvedValue({ port: 4001 });
+    expect(await desktop?.isConnected()).toBe(true);
+    expect((await listConnectedClientTargets()).map((target) => target.id)).toContain('claude-desktop');
+    // What Desktop actually uses (the status/doctor key reading) stays on the applied entry.
+    expect(await desktop?.gateway?.read(STATE)).toBeNull();
   });
 
   it('each row disconnects through its own remover, with the Insiders flag and the user scope', async () => {
@@ -325,5 +353,31 @@ describe('client-target table', () => {
     readDaemonStatus.mockResolvedValue({ running: true, state: { ...STATE, version: undefined } });
     const rows = (JSON.parse(await runClients(['--json'])) as { clients: ClientRow[] }).clients;
     expect(rows.find((row) => row.id === 'copilot-chat-otlp')?.hint).toBe('not connected');
+  });
+
+  it('in the local mode a hint names `codemie analytics sync install`, and no line names proxy connect or disconnect', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'proxy-clients-local-'));
+    vi.stubEnv('CODEMIE_HOME', home);
+    try {
+      writeFileSync(join(home, 'analytics-sync.json'), JSON.stringify({
+        webhookUrl: 'https://hooks.example.invalid/x?sig=FAKE',
+        format: 'json',
+        includeExternal: 'never',
+        at: '03:00',
+        local: true,
+        localJob: { node: '/usr/bin/node', entry: '/opt/codemie/bin/codemie.js' },
+      }));
+
+      const out = stripVTControlCharacters(await runClients([]));
+
+      expect(out).toMatch(/Copilot Chat\s+not connected — run: codemie analytics sync install/);
+      for (const line of out.split('\n')) {
+        expect(line).not.toContain('proxy connect');
+        expect(line).not.toContain('proxy disconnect');
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

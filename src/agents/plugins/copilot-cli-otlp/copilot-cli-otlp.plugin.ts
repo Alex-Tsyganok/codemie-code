@@ -3,18 +3,27 @@ import { closeSync, existsSync, openSync, readSync } from 'node:fs';
 import { join } from 'node:path';
 import { OtlpAgentAdapter, type OtlpHookContext } from '@/agents/core/OtlpAgentAdapter.js';
 import { isSafeSessionId } from '@/agents/core/session-id.js';
-import { ensureCodeMieSsoAuth } from '@/providers/plugins/sso/sso.auth-gate.js';
+import { ensureCodeMieSsoAuth, type AuthGateResult } from '@/providers/plugins/sso/sso.auth-gate.js';
 import { describeLogin, type DetachedLoginOutcome } from '@/providers/plugins/sso/sso.detached-login.js';
 import { resolveHookAuthProfile } from '@/agents/core/hook-auth-profile.js';
 import { maskSecretsInText } from '@/utils/security.js';
 import { logger } from '@/utils/logger.js';
 import { detectGitBranch } from '@/utils/processes.js';
-import { evaluateCopilotAnalyticsGate } from '@/agents/core/copilot-analytics-gate.js';
+import { COPILOT_FILTER_REASONS, evaluateCopilotAnalyticsGate, type CopilotAnalyticsGateReason } from '@/agents/core/copilot-analytics-gate.js';
 import { getCopilotSessionStateRoot } from '@/agents/plugins/copilot-cli/copilot-cli.paths.js';
 import type { CopilotSessionStartData } from '@/agents/plugins/copilot-cli/copilot-cli-event-types.js';
 import { extractSlashCommand, normalizeUserPrompt, PINNED_NATIVE_SESSION_ENV, resolveCopilotAgentKey } from '@/agents/plugins/copilot-cli/copilot-cli.constants.js';
 import { readWorkspaceManifest } from '@/agents/plugins/copilot-cli/copilot-cli.workspace.js';
+import { currentEvidenceIdentity } from '@/agents/core/evidence/hook-identity.js';
+import { readRecord, recordKey } from '@/agents/core/evidence/record-store.js';
+import { isStopped, writeStop } from '@/agents/core/evidence/stop-marker.js';
+import { currentGeneration, scopeViolation } from '@/agents/core/evidence/session-scope.js';
+import { hasPendingOwnerSession } from '@/agents/core/evidence/owner-pending.js';
+import { isDaemonAlive, readState } from '@/cli/commands/proxy/daemon-manager.js';
+import { isRestartableState } from '@/cli/commands/proxy/otlp-cold-start.js';
+import { resolveProjectAtCwd } from '@/agents/core/event-fields/identity-fields.js';
 import { COPILOT_CLI_OTLP_AGENT_NAME } from './copilot-cli-otlp.constants.js';
+import { copilotEvidenceInputs, copilotRouteProof, isFreshStart, isKnownSession } from './copilot-cli-otlp.evidence.js';
 import { buildStopPass, type StopPass } from './copilot-cli-otlp.stop-pass.js';
 import { TOOL_STATE_BUDGET_MS, readSessionState, resolveRootSessionId, sweepStaleStateFiles, updateSessionState } from './copilot-cli-otlp.state.js';
 import { recordOpenStarts, resolveEndToolUseId } from './copilot-cli-otlp.tool-correlation.js';
@@ -101,17 +110,83 @@ export class CopilotCliOtlpPlugin extends OtlpAgentAdapter<CopilotCliHookInput, 
     return parsed;
   }
 
-  protected extractHookContext(input: CopilotCliHookInput): OtlpHookContext {
-    return {
-      cwd: input.cwd,
-      prompt: input.codemieEventName === 'userPromptTransformed' ? userPrompt(input.prompt, input.transformedPrompt) : undefined,
-    };
+  protected async extractHookContext(input: CopilotCliHookInput): Promise<OtlpHookContext> {
+    const prompt = input.codemieEventName === 'userPromptTransformed' ? userPrompt(input.prompt, input.transformedPrompt) : undefined;
+    const evidenceInputs = await copilotEvidenceInputs({
+      sessionId: input.sessionId,
+      managed: isManagedSession(input.sessionId),
+      pinned: process.env[PINNED_NATIVE_SESSION_ENV] === input.sessionId,
+      freshStart: isFreshStart(input.codemieEventName, input.source),
+    });
+    // Only a CodeMie-proven session is recorded (and its project pinned); every other session keeps the unrecorded path.
+    return evidenceInputs ? { cwd: input.cwd, prompt, sessionId: input.sessionId, evidenceInputs } : { cwd: input.cwd, prompt };
+  }
+
+  /**
+   * A recorded session stops spooling when its stop marker exists or its project/generation no longer matches
+   * the record (same rule as Claude's gate). Unrecorded sessions are untouched; anything unreadable fails closed.
+   */
+  protected override async transitionGate(input: CopilotCliHookInput): Promise<'continue' | 'stop' | 'retry-after-proxy-start'> {
+    try {
+      const proven = copilotRouteProof(isManagedSession(input.sessionId)) !== undefined;
+      // Sticky attribution: a session the evidence store knows keeps its claim only while the route is still proven.
+      const id = await currentEvidenceIdentity();
+      // A session-wide existence check is only a stop signal: it never authorizes anything.
+      if (!id) {
+        if (!(await isKnownSession(input.sessionId))) return 'continue';
+        if (!proven) return 'stop';
+        if (await hasPendingOwnerSession(input.sessionId)) return 'continue';
+        // Credentials are resolved from daemon state. Start the proxy, then recheck the session before it can spool.
+        const state = await readState();
+        return !state || (!isRestartableState(state) && !(await isDaemonAlive(state)))
+          ? 'retry-after-proxy-start'
+          : 'stop';
+      }
+      const key = recordKey(id.api_identity, id.owner_hash, input.sessionId);
+      const found = await readRecord(key);
+      if (!found) {
+        if (!(await isKnownSession(input.sessionId))) return 'continue'; // an unrecorded session
+        // Known, but not at this login's key (login/profile changed) or only held for its owner: continue only a proven, owner-held session.
+        if (proven && (await hasPendingOwnerSession(input.sessionId))) return 'continue';
+        await writeStop(key, 'scope_unproven', input.sessionId);
+        return 'stop';
+      }
+      if (found.kind !== 'existing' && found.kind !== 'created') return 'stop';
+      if (await isStopped(key)) return 'stop';
+      const generation = await currentGeneration(found.record);
+      if (generation === undefined) return 'stop';
+      const violation = !proven ? 'scope_unproven' as const : await scopeViolation(found.record, {
+        cwd: input.cwd,
+        projectAtCwd: await resolveProjectAtCwd(input.cwd, found.record.profile, { configuredWins: true, walkFromCwd: true }),
+        generation,
+      });
+      if (!violation) return 'continue';
+      await writeStop(key, violation, input.sessionId);
+      return 'stop';
+    } catch (err) {
+      logger.debug(`[${this.name}] transition check failed: ${err instanceof Error ? err.name : 'error'}`);
+      return 'stop';
+    }
   }
 
   protected async isTracked(input: CopilotCliHookInput): Promise<boolean> {
     // The connector scope applies to managed and native sessions alike; both are labelled
     // through `entrypoint` and counted once, by Copilot's own session id.
-    return (await evaluateCopilotAnalyticsGate(this.name, input.cwd)).tracked;
+    const decision = await evaluateCopilotAnalyticsGate(this.name, input.cwd);
+    this.gateReason = decision.tracked ? undefined : decision.reason;
+    return decision.tracked;
+  }
+
+  /** The reason of the last `isTracked` refusal. */
+  private gateReason?: CopilotAnalyticsGateReason;
+
+  protected override async untrackedByFilter(): Promise<boolean> {
+    return this.gateReason !== undefined && COPILOT_FILTER_REASONS.has(this.gateReason);
+  }
+
+  /** The root session's id: `parseHookInput` re-keys a sub-agent's hooks to it. */
+  protected override sessionIdOf(input: CopilotCliHookInput): string | undefined {
+    return input.sessionId;
   }
 
   protected async resolveAgentFields(input: CopilotCliHookInput): Promise<Record<string, unknown>> {
@@ -193,7 +268,7 @@ export class CopilotCliOtlpPlugin extends OtlpAgentAdapter<CopilotCliHookInput, 
   };
 
   private async onPrompt(input: CopilotCliHookInput): Promise<CliForwardDecision> {
-    const authResult = await this.ensureProxyAuth();
+    const authResult = await this.policy.authorize<AuthGateResult>(() => this.ensureProxyAuth(), { ok: true });
     if (!authResult.ok) {
       return this.buildBlock('userPromptTransformed', authResult.reason, true, authResult.loginOutcome);
     }
@@ -207,7 +282,7 @@ export class CopilotCliOtlpPlugin extends OtlpAgentAdapter<CopilotCliHookInput, 
 
   /** Auth once for the whole batch; a denial denies every call and records nothing. */
   private async onToolStart(input: CopilotCliHookInput): Promise<CliForwardDecision> {
-    const authResult = await this.ensureProxyAuth();
+    const authResult = await this.policy.authorize<AuthGateResult>(() => this.ensureProxyAuth(), { ok: true });
     if (!authResult.ok) {
       return this.buildBlock('preToolUse', authResult.reason, true, authResult.loginOutcome);
     }
@@ -241,6 +316,10 @@ export class CopilotCliOtlpPlugin extends OtlpAgentAdapter<CopilotCliHookInput, 
 
   private async onSessionStart(input: CopilotCliHookInput): Promise<CliForwardDecision> {
     sweepStaleStateFiles();
+    // Recorded now, not only at sessionEnd: an aborted sessionEnd must still leave the daemon the custom COPILOT_HOME.
+    if (!(await updateSessionState(input.sessionId, { sessionStateRoot: getCopilotSessionStateRoot() }, 1_000))) {
+      logger.debug('[copilot-cli-otlp] failed to record session-state root at start');
+    }
     return { decision: 'forward', payload: [this.normalizeEvent(input)] };
   }
 

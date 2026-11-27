@@ -17,6 +17,7 @@ import { SyncConfigError } from '@/utils/errors.js';
 import { writePrivateJson, writePrivateText } from './private-file.js';
 import { decodeWebhook } from './webhook-encoding.js';
 import { redactSecrets } from './redact.js';
+import { validateSchedulerName } from './scheduler/generators.js';
 import type { GitSettings, IncludeExternalPolicy, InstallOptions, SyncSettings } from './types.js';
 
 export const DEFAULT_LOOKBACK_DAYS = 7;
@@ -295,6 +296,7 @@ export function validateInstallOptions(options: InstallOptions): SyncSettings {
   const at = validateAt(options.at);
   const includeExternal = validateIncludeExternal(options.includeExternal);
   const lookbackDays = validateLookbackDays(options.lookbackDays);
+  const taskName = options.taskName === undefined ? undefined : validateSchedulerName(options.taskName.trim());
 
   return {
     ...(webhookUrl !== undefined && { webhookUrl }),
@@ -302,7 +304,8 @@ export function validateInstallOptions(options: InstallOptions): SyncSettings {
     format,
     includeExternal,
     at,
-    ...(lookbackDays !== undefined && { lookbackDays })
+    ...(lookbackDays !== undefined && { lookbackDays }),
+    ...(taskName !== undefined && { taskName })
   };
 }
 
@@ -386,11 +389,42 @@ export async function loadSyncSettings(path: string = getSyncSettingsPath()): Pr
     settings.lookbackDays = stored.lookbackDays;
   }
 
+  if (stored.taskName !== undefined) {
+    try {
+      settings.taskName = validateSchedulerName(stored.taskName);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new SyncConfigError(`Sync settings at ${path} has an invalid taskName: ${reason}`);
+    }
+  }
+
+  if (stored.local !== undefined) {
+    if (stored.local !== true) {
+      throw new SyncConfigError(`Sync settings at ${path} has an invalid local: expected true.`);
+    }
+    settings.local = true;
+  }
+
+  if (stored.localJob !== undefined) {
+    const job = stored.localJob as unknown;
+    if (!isLocalJob(job)) {
+      throw new SyncConfigError(`Sync settings at ${path} has an invalid localJob: expected non-empty node and entry.`);
+    }
+    settings.localJob = { node: job.node, entry: job.entry };
+  }
+
   return settings;
 }
 
+function isLocalJob(value: unknown): value is { node: string; entry: string } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const { node, entry } = value as Record<string, unknown>;
+  return typeof node === 'string' && node !== '' && typeof entry === 'string' && entry !== '';
+}
+
 /**
- * Write `settings` to `path` (defaults to `getSyncSettingsPath()`), mode `0o600`.
+ * Write `settings` to `path` (defaults to `getSyncSettingsPath()`), mode `0o600`, through a
+ * temporary file renamed over it.
  *
  * Always a whole-file overwrite: a pre-existing file at `path` — including one written by
  * the standalone collector, with a different shape — is replaced entirely.
@@ -415,7 +449,7 @@ export async function readSyncSettingsRaw(path: string = getSyncSettingsPath()):
   }
 }
 
-/** Put back a settings file read by {@link readSyncSettingsRaw}, mode `0o600`. */
+/** Put back a settings file read by {@link readSyncSettingsRaw}, mode `0o600`, through a temporary file renamed over it. */
 export async function restoreSyncSettingsRaw(raw: string, path: string = getSyncSettingsPath()): Promise<void> {
   await writePrivateText(path, raw);
 }
